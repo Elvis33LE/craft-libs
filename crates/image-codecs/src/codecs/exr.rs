@@ -238,6 +238,65 @@ fn layer_to_image(layer: &Layer<AnyChannels<FlatSamples>>) -> Result<Image, Code
     Ok(img)
 }
 
+fn stage_image(mut image: Image, header: &exr::meta::header::Header, limits: &Limits) -> Result<Image, CodecError> {
+    let data = header.own_attributes.layer_position;
+    let display = header.shared_attributes.display_window;
+    let (dw, dh) = (header.layer_size.0 as i64, header.layer_size.1 as i64);
+    let (sw, sh) = (display.size.0 as i64, display.size.1 as i64);
+    if data.0 == display.position.0 && data.1 == display.position.1 && dw == sw && dh == sh {
+        return Ok(image);
+    }
+    if data.0 < display.position.0
+        || data.1 < display.position.1
+        || i64::from(data.0) + dw > i64::from(display.position.0) + sw
+        || i64::from(data.1) + dh > i64::from(display.position.1) + sh
+    {
+        return Ok(image);
+    }
+    let (w, h) = (u32::try_from(sw).map_err(err)?, u32::try_from(sh).map_err(err)?);
+    limits.check_bytes(w, h, 16)?;
+    let x = usize::try_from(data.0 - display.position.0).map_err(err)?;
+    let y = usize::try_from(data.1 - display.position.1).map_err(err)?;
+    let nc = image.layout().channels();
+    let npx = usize::try_from(w).map_err(err)?.checked_mul(usize::try_from(h).map_err(err)?).ok_or_else(|| err("EXR stage size"))?;
+    let src_w = image.width() as usize;
+    if let Some(source) = image.to_f16_samples() {
+        let mut pixels = Vec::new();
+        let len = npx.checked_mul(nc).ok_or_else(|| err("EXR stage allocation"))?;
+        pixels.try_reserve_exact(len).map_err(|_| CodecError::LimitExceeded("EXR stage allocation".into()))?;
+        pixels.resize(len, f16::ZERO);
+        for row in 0..image.height() as usize {
+            let src = row * src_w * nc;
+            let dst = ((y + row) * w as usize + x) * nc;
+            pixels
+                .get_mut(dst..dst + src_w * nc)
+                .ok_or_else(|| err("EXR stage row"))?
+                .copy_from_slice(source.get(src..src + src_w * nc).ok_or_else(|| err("EXR source row"))?);
+        }
+        image = Image::from_f16(w, h, image.layout(), &pixels)?;
+    } else if let Some(source) = image.to_f32_samples() {
+        let mut pixels = Vec::new();
+        let len = npx.checked_mul(nc).ok_or_else(|| err("EXR stage allocation"))?;
+        pixels.try_reserve_exact(len).map_err(|_| CodecError::LimitExceeded("EXR stage allocation".into()))?;
+        pixels.resize(len, 0.0_f32);
+        for row in 0..image.height() as usize {
+            let src = row * src_w * nc;
+            let dst = ((y + row) * w as usize + x) * nc;
+            pixels
+                .get_mut(dst..dst + src_w * nc)
+                .ok_or_else(|| err("EXR stage row"))?
+                .copy_from_slice(source.get(src..src + src_w * nc).ok_or_else(|| err("EXR source row"))?);
+        }
+        image = Image::from_f32(w, h, image.layout(), &pixels)?;
+    } else {
+        return Err(err("EXR sample conversion"));
+    }
+    image
+        .warnings
+        .push(DecodeWarning::DisplayWindowStage { stage: (w, h), origin: (i32::try_from(x).map_err(err)?, i32::try_from(y).map_err(err)?) });
+    Ok(image)
+}
+
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let meta = read_meta(bytes, limits)?;
 
@@ -249,7 +308,9 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     }
 
     let pick = pick_part(&meta);
-    let mut img = layer_to_image(&read_layer(bytes, pick)?)?;
+    // Reject an oversized display canvas from the headers alone, before any pixel decode.
+    check_display_stage(&meta, pick, limits)?;
+    let mut img = stage_image(layer_to_image(&read_layer(bytes, pick)?)?, &meta.headers[pick], limits)?;
     if meta.headers.len() > 1 {
         let total = u32::try_from(meta.headers.len()).ok();
         img.warnings.push(DecodeWarning::MoreParts { total });
@@ -272,6 +333,28 @@ pub(crate) fn probe(bytes: &[u8], limits: &Limits) -> Result<(u32, u32), CodecEr
     Ok((info.width, info.height))
 }
 
+/// Rejects a contained display window this part would stage onto when its canvas exceeds the
+/// limits, from the headers alone and before any pixel is decoded. Deep files never stage, so
+/// they are never charged here; non-contained windows keep their data-window canvas.
+fn check_display_stage(meta: &MetaData, part: usize, limits: &Limits) -> Result<(), CodecError> {
+    let header = &meta.headers[part];
+    let data = header.own_attributes.layer_position;
+    let display = header.shared_attributes.display_window;
+    let size = header.layer_size;
+    let contained = data.0 >= display.position.0
+        && data.1 >= display.position.1
+        && i64::from(data.0) + size.0 as i64 <= i64::from(display.position.0) + display.size.0 as i64
+        && i64::from(data.1) + size.1 as i64 <= i64::from(display.position.1) + display.size.1 as i64;
+    if contained {
+        let sw = u32::try_from(display.size.0).unwrap_or(u32::MAX);
+        let sh = u32::try_from(display.size.1).unwrap_or(u32::MAX);
+        // 16 bytes a pixel is the widest staged sample (RGBA F32); `stage_image` applies the
+        // same bound before it allocates, so this never refuses a stage that would fit.
+        limits.check_bytes(sw, sh, 16)?;
+    }
+    Ok(())
+}
+
 /// Decode one part of a multi-part file by its index into [`info`]'s list. A file with
 /// deep parts is not mixed: the deep decoder composites those instead.
 pub(crate) fn decode_part(bytes: &[u8], index: usize, limits: &Limits) -> Result<Image, CodecError> {
@@ -285,7 +368,9 @@ pub(crate) fn decode_part(bytes: &[u8], index: usize, limits: &Limits) -> Result
     if index >= meta.headers.len() {
         return Err(err(format!("part index {index} is out of range ({} parts)", meta.headers.len())));
     }
-    layer_to_image(&read_layer(bytes, index)?)
+    // Reject an oversized display canvas from the headers alone, before any pixel decode.
+    check_display_stage(&meta, index, limits)?;
+    stage_image(layer_to_image(&read_layer(bytes, index)?)?, &meta.headers[index], limits)
 }
 
 /// Decodes the named channels of one flat part (exact names as the file stores them, e.g.
